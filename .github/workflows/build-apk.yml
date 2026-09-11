@@ -1,0 +1,180 @@
+name: Build Gorilla Gym APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf build_project
+          mkdir -p build_project
+
+          SETTINGS_FILE="$(find . -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -not -path './.git/*' \
+            -not -path './build_project/*' \
+            -print -quit)"
+
+          if [ -n "$SETTINGS_FILE" ]; then
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            echo "Android project found directly at: $PROJECT_DIR"
+          else
+            PROJECT_ZIP=""
+
+            while IFS= read -r -d '' candidate; do
+              if unzip -l "$candidate" | grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then
+                PROJECT_ZIP="$candidate"
+                break
+              fi
+            done < <(find . -maxdepth 1 -type f -iname '*.zip' -print0)
+
+            if [ -z "$PROJECT_ZIP" ]; then
+              echo "ERROR: No Android project was found."
+              echo "The repository must contain the Android project or a ZIP containing settings.gradle/settings.gradle.kts."
+              exit 1
+            fi
+
+            echo "Android project ZIP found: $PROJECT_ZIP"
+
+            unzip -q "$PROJECT_ZIP" -d build_project
+
+            SETTINGS_FILE="$(find build_project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print -quit)"
+
+            if [ -z "$SETTINGS_FILE" ]; then
+              echo "ERROR: Android project could not be located after extraction."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+            echo "Android project extracted to: $PROJECT_DIR"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Validate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$PROJECT_DIR/settings.gradle" || test -f "$PROJECT_DIR/settings.gradle.kts"
+          test -f "$PROJECT_DIR/build.gradle" || test -f "$PROJECT_DIR/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/build.gradle" || test -f "$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -f "$PROJECT_DIR/app/src/main/assets/index.html"
+
+          echo "Android project validation passed."
+
+      - name: Validate web app JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          project_dir = Path(os.environ["PROJECT_DIR"])
+          html = (project_dir / "app/src/main/assets/index.html").read_text(encoding="utf-8")
+
+          scripts = re.findall(
+              r'<script(?:\s[^>]*)?>(.*?)</script>',
+              html,
+              re.S | re.I
+          )
+
+          if not scripts:
+              raise SystemExit("ERROR: No inline JavaScript was found in index.html")
+
+          Path("/tmp/gorilla-gym.js").write_text(
+              "\n".join(scripts),
+              encoding="utf-8"
+          )
+
+          print("Extracted JavaScript for syntax validation.")
+          PY
+
+          node --check /tmp/gorilla-gym.js
+
+          echo "JavaScript syntax validation passed."
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gradle --no-daemon clean assembleDebug
+
+      - name: Prepare APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FILE="$(find "$PROJECT_DIR" \
+            -type f \
+            -path '*/build/outputs/apk/debug/*.apk' \
+            -print -quit)"
+
+          if [ -z "$APK_FILE" ]; then
+            echo "ERROR: No Debug APK was generated."
+
+            find "$PROJECT_DIR" \
+              -type f \
+              -name '*.apk' \
+              -print || true
+
+            exit 1
+          fi
+
+          mkdir -p artifact
+
+          cp "$APK_FILE" artifact/GorillaGym-debug.apk
+
+          ls -lh artifact/GorillaGym-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gorilla-Gym-APK
+          path: artifact/GorillaGym-debug.apk
+          if-no-files-found: error
+          retention-days: 7
