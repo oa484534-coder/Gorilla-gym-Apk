@@ -1,0 +1,116 @@
+name: Gorilla Gym APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find Android project
+        id: project
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT=""
+
+          if [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            PROJECT="."
+          else
+            for ZIP in ./*.zip; do
+              [ -f "$ZIP" ] || continue
+
+              if unzip -l "$ZIP" | grep -qE '(^|/)settings\.gradle(\.kts)?$'; then
+                echo "Android project found in: $ZIP"
+
+                rm -rf android_project
+                mkdir android_project
+
+                unzip -q "$ZIP" -d android_project
+
+                SETTINGS=$(find android_project \
+                  -type f \
+                  \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+                  -print -quit)
+
+                if [ -n "$SETTINGS" ]; then
+                  PROJECT=$(dirname "$SETTINGS")
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: Android project not found."
+            echo "The repository must contain an Android project directly or a ZIP containing settings.gradle."
+            exit 1
+          fi
+
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project directory: $PROJECT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT }}
+        shell: bash
+        run: |
+          set -e
+
+          gradle --no-daemon clean assembleDebug
+
+      - name: Check APK
+        shell: bash
+        run: |
+          set -e
+
+          APK=$(find "$PROJECT" \
+            -type f \
+            -name "app-debug.apk" \
+            -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          mkdir -p output
+          cp "$APK" output/GorillaGym.apk
+
+          echo "APK created successfully:"
+          ls -lh output/GorillaGym.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GorillaGym-APK
+          path: output/GorillaGym.apk
+          if-no-files-found: error
